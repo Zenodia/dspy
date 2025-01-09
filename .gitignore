@@ -7,7 +7,15 @@
 /logs/
 /docs/downloads/
 /docs/experiments/
-
+/nvdata/
+/nvdata
+nvdata
+*.db
+*.json
+*.csv
+*.xlsx
+*.z8
+*.ipynb_checkpoint
 /examples/qa/hotpot/MIPRO_notebook_cache/
 /examples/nli/scone/MIPRO_notebook_cache/
 /examples/nli/scone/ScoNe/
