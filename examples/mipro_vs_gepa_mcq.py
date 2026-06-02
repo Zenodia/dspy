@@ -28,24 +28,28 @@ from dotenv import load_dotenv
 load_dotenv()
 
 NVIDIA_API_KEY = os.environ["NVIDIA_API_KEY"]
-TASK_MODEL = os.environ.get("NeMoTronModel", "nvidia/llama-3.3-nemotron-super-49b-v1.5")
 BASE_URL = "https://integrate.api.nvidia.com/v1"
+
+# Canonical GEPA setup: a small/cheap *student* model runs the program (so there
+# is room to improve), and a strong *reflection* model rewrites the prompts.
+STUDENT_MODEL = "meta/llama-3.1-8b-instruct"
+REFLECTION_MODEL = os.environ.get("NeMoTronModel", "nvidia/llama-3.3-nemotron-super-49b-v1.5")
 
 # dspy routes through litellm; the `openai/` prefix tells litellm to use the
 # OpenAI chat protocol against the custom api_base below.
 task_lm = dspy.LM(
-    f"openai/{TASK_MODEL}",
+    f"openai/{STUDENT_MODEL}",
     api_key=NVIDIA_API_KEY,
     api_base=BASE_URL,
     temperature=0.6,
-    max_tokens=8000,  # reasoning models spend tokens on the think trace
+    max_tokens=2000,
 )
 dspy.configure(lm=task_lm)
 
 # GEPA needs a (typically strong) model to *reflect* on failures and rewrite
-# prompts. We reuse the same reasoning model at high temperature.
+# prompts. We use the NVIDIA reasoning model at high temperature.
 reflection_lm = dspy.LM(
-    f"openai/{TASK_MODEL}",
+    f"openai/{REFLECTION_MODEL}",
     api_key=NVIDIA_API_KEY,
     api_base=BASE_URL,
     temperature=1.0,
@@ -60,61 +64,60 @@ reflection_lm = dspy.LM(
 # commonly-confused facts. A strong reasoning model still slips on these, which
 # leaves headroom for the optimizers to improve the prompt.
 RAW = [
+    # train (0:20) — interleaved counting/tokenization traps + logic traps
     ("A bat and a ball cost $1.10 in total. The bat costs $1.00 more than the ball. How much does the ball cost?",
      ["$0.10", "$0.05", "$1.00", "$0.15"], "B"),
-    ("How many times does the letter 'a' appear in the word 'banana'?", ["1", "2", "3", "4"], "C"),
+    ("How many times does the letter 'r' appear in the word 'strawberry'?", ["2", "3", "4", "1"], "B"),
     ("Which of these is NOT a prime number?", ["2", "3", "9", "11"], "C"),
     ("If you are running a race and you overtake the person in 2nd place, what place are you in now?",
      ["1st", "2nd", "3rd", "Last"], "B"),
+    ("How many times does the letter 's' appear in the word 'Mississippi'?", ["2", "3", "4", "5"], "C"),
     ("A pound of feathers and a pound of bricks: which weighs more?",
      ["The bricks", "The feathers", "They weigh the same", "Cannot be determined"], "C"),
     ("Which word is spelled correctly?", ["Neccessary", "Necesary", "Necessary", "Neccesary"], "C"),
-    ("All Bloops are Razzies and all Razzies are Lazzies. Are all Bloops definitely Lazzies?",
-     ["No", "Only some", "Yes", "Cannot tell"], "C"),
+    ("How many times does the letter 'a' appear in the word 'abracadabra'?", ["3", "4", "5", "6"], "C"),
     ("A farmer has 17 sheep. All but 9 die. How many sheep are left?", ["8", "9", "17", "0"], "B"),
-    ("Which of the following is the largest?", ["0.9", "0.099", "0.1", "0.19"], "A"),
+    ("Which of the following decimals is the largest?", ["0.9", "0.099", "0.1", "0.19"], "A"),
+    ("How many times does the letter 'e' appear in the word 'cheese'?", ["1", "2", "3", "4"], "C"),
     ("Mary's father has five daughters: Nana, Nene, Nini, Nono, and ___. What is the fifth daughter's name?",
      ["Nunu", "Mary", "Nana", "None of these"], "B"),
     ("How many months have 28 days?", ["1", "2", "11", "12"], "D"),
-    ("Which is heavier: 1 kilogram or 1000 grams?", ["1 kilogram", "1000 grams", "They are equal", "Depends on material"], "C"),
+    ("How many letters are in the word 'Mississippi'?", ["9", "10", "11", "12"], "C"),
     ("What is the next number in the sequence: 2, 4, 8, 16, ...?", ["20", "24", "32", "64"], "C"),
-    ("Which sentence uses 'their' correctly?",
-     ["Their going home.", "The dogs wagged their tails.", "Its over their.", "Their is a problem."], "B"),
-    ("A clock shows 3:15. What is the angle between the hour and minute hands?",
-     ["0 degrees", "7.5 degrees", "37.5 degrees", "90 degrees"], "B"),
-    ("Which of these is NOT a mammal?", ["Whale", "Bat", "Platypus", "Penguin"], "D"),
+    ("How many times does the letter 'o' appear in the word 'tomorrow'?", ["1", "2", "3", "4"], "C"),
     ("If it takes 5 machines 5 minutes to make 5 widgets, how long for 100 machines to make 100 widgets?",
      ["100 minutes", "5 minutes", "20 minutes", "1 minute"], "B"),
-    ("Which number is both a perfect square and a perfect cube?", ["8", "16", "36", "64"], "D"),
+    ("What word do you get by reversing the letters of 'stressed'?",
+     ["desserts", "stresseds", "dessert", "sertsedd"], "A"),
     ("'I am lying.' If this statement is spoken, it is best described as a:",
      ["True statement", "False statement", "Paradox", "Question"], "C"),
+    ("How many times does the letter 's' appear in the word 'success'?", ["2", "3", "4", "1"], "B"),
+    # val (20:30)
     ("Which planet has the most moons (as of 2024)?", ["Jupiter", "Saturn", "Uranus", "Neptune"], "B"),
+    ("How many vowels are in the word 'beautiful'?", ["3", "4", "5", "6"], "C"),
     ("What is 0 divided by 5?", ["0", "5", "Undefined", "Infinity"], "A"),
-    ("Which of these is NOT one of the primary colors of light (RGB)?",
-     ["Red", "Green", "Yellow", "Blue"], "C"),
-    ("A car travels 60 miles in 1 hour, then 60 miles in 2 hours. What is its average speed?",
+    ("A car travels 60 miles in 1 hour, then another 60 miles in 2 hours. What is its average speed?",
      ["60 mph", "45 mph", "40 mph", "30 mph"], "C"),
-    ("How many degrees are in the interior angles of a triangle, total?", ["90", "180", "270", "360"], "B"),
-    ("Which is the odd one out?", ["Square", "Circle", "Triangle", "Rectangle"], "B"),
+    ("How many times does the letter 't' appear in the word 'committee'?", ["1", "2", "3", "4"], "B"),
     ("If today is Monday, what day will it be 100 days from now?",
      ["Monday", "Tuesday", "Wednesday", "Thursday"], "C"),
-    ("Which of these words is a palindrome?", ["Level", "World", "House", "Table"], "A"),
-    ("What is the smallest two-digit prime number?", ["10", "11", "13", "17"], "B"),
-    ("Forest is to trees as library is to ___?", ["Books", "Reading", "Quiet", "Building"], "A"),
-    ("Which of these is NOT a noble gas?", ["Helium", "Neon", "Nitrogen", "Argon"], "C"),
-    ("A rope ladder hangs over the side of a ship. Rungs are 1 ft apart; tide rises 1 ft/hr. After 3 hours, how many rungs are underwater if 2 were underwater at the start?",
-     ["2", "3", "5", "8"], "A"),
-    ("Which fraction is the largest?", ["3/4", "5/8", "7/10", "2/3"], "A"),
-    ("How many sides does a 'nonagon' have?", ["7", "8", "9", "10"], "C"),
-    ("Which statement about the equator is FALSE?",
-     ["It divides Earth into hemispheres", "It is the longest line of latitude", "It passes through Brazil", "It is colder than the poles"], "D"),
-    ("What comes next: J, F, M, A, M, ...?", ["J", "A", "N", "S"], "A"),
-    ("If 5 + 3 = 28, 9 + 1 = 810, then 8 + 6 = ?", ["214", "148", "1428", "68"], "A"),
-    ("Which of these is NOT a programming language?", ["Python", "Java", "Cobra", "HTML"], "D"),
+    ("Which of these is NOT a mammal?", ["Whale", "Bat", "Platypus", "Penguin"], "D"),
+    ("How many times does the letter 'p' appear in the word 'pineapple'?", ["1", "2", "3", "4"], "C"),
     ("A snail climbs 3 ft up a 10 ft well by day but slips 2 ft each night. How many days to get out?",
      ["10", "8", "7", "5"], "B"),
-    ("Which weighs the same as 16 ounces?", ["1 pound", "1 kilogram", "1 stone", "1 gram"], "A"),
     ("What is the only even prime number?", ["1", "2", "4", "0"], "B"),
+    # test (30:40)
+    ("If 5 + 3 = 28, 9 + 1 = 810, then 8 + 6 = ?", ["214", "148", "1428", "68"], "A"),
+    ("How many times does the letter 'r' appear in the word 'raspberry'?", ["2", "3", "4", "1"], "B"),
+    ("How many sides does a 'nonagon' have?", ["7", "8", "9", "10"], "C"),
+    ("A rope ladder hangs over the side of a ship. Rungs are 1 ft apart; the tide rises 1 ft/hr. If 2 rungs are underwater at the start, how many are underwater after 3 hours?",
+     ["2", "3", "5", "8"], "A"),
+    ("How many times does the letter 'e' appear in the word 'elephant'?", ["1", "2", "3", "4"], "B"),
+    ("Which fraction is the largest?", ["3/4", "5/8", "7/10", "2/3"], "A"),
+    ("How many times does the letter 'n' appear in the word 'banana'?", ["1", "2", "3", "4"], "B"),
+    ("Which of these is NOT a noble gas?", ["Helium", "Neon", "Nitrogen", "Argon"], "C"),
+    ("How many letters are in the word 'bookkeeper'?", ["9", "10", "11", "12"], "B"),
+    ("What is the smallest two-digit prime number?", ["10", "11", "13", "17"], "B"),
 ]
 
 
