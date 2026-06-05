@@ -76,9 +76,10 @@ load_dotenv("/home/ubuntu/dspy/.env")
 
 NVIDIA_API_KEY = os.environ["NVIDIA_API_KEY"]
 BASE_URL = "https://integrate.api.nvidia.com/v1"
+model="nvidia/nemotron-3-ultra-550b-a55b"
 
 # --- models ---------------------------------------------------------------- #
-REASONER_MODEL = "moonshotai/kimi-k2.6"                       # .env VLM_Model
+REASONER_MODEL = "nvidia/nemotron-3-ultra-550b-a55b" #"moonshotai/kimi-k2.6"                       # .env VLM_Model
 SUMMARIZER_MODEL = "nvidia/llama-3.3-nemotron-super-49b-v1"   # GEPA target
 # (.env NeMoTronModel is the v1.5 variant; swap here if v1 is unavailable.)
 EMBED_MODEL = "nvidia/nv-embedqa-e5-v5"  # embedqa, live + callable on this account (1024-d)
@@ -328,7 +329,9 @@ class HaystackMemoryAgent(dspy.Module):
             task, info = env.init(idx)
             goal = parse_goal(task)
             log_goal(goal)   # objective of this game, recorded before the trace
+            print(Fore.CYAN + Style.BRIGHT + f"Game Goal: {goal}" + Style.RESET_ALL, flush=True)
             log_task(task)
+            print(Fore.CYAN + Style.BRIGHT + f"Game Task: {task}" + Style.RESET_ALL, flush=True)
 
             for _ in range(self.max_iters):
                 admissible = info["admissible_commands"][0]

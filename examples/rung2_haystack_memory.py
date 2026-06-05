@@ -64,10 +64,25 @@ REASONER_MODEL = "nvidia/nemotron-3-ultra-550b-a55b"
 SUMMARIZER_MODEL = "nvidia/llama-3.3-nemotron-super-49b-v1"
 EMBED_MODEL = "nvidia/nv-embedqa-e5-v5"
 
+# MAX_ITERS: step budget per episode. 50 gives hard tasks room to explore;
+#   lower (e.g. 20) for faster smoke runs, raise if tasks still time out.
+# GAMMA: discount factor derived from H so that a 1-step solve scores ~1.0 and
+#   an H-step solve scores ~1/e. Do not set manually -- change H instead.
 H = MAX_ITERS = 50
 GAMMA = math.exp(-1.0 / (H - 1))   # ~0.9798, for the same return metric as baseline
-TOP_K_MEMORY = 3
+
+# TOP_K_MEMORY: facts returned from the Haystack vector store each step.
+#   3 keeps the prompt tight and avoids redundant context on small stores.
+#   Raise (e.g. 5-10) if the agent misses relevant facts in large, long episodes.
+TOP_K_MEMORY = 10
+
+# NUM_THREADS: parallel env workers. Keep at 1 unless you have multiple API keys;
+#   the 40 RPM free-tier limit serialises everything anyway.
 NUM_THREADS = 1
+
+# MIN_INTERVAL: seconds between Haystack/NVIDIA API calls (embed + reason).
+#   2.2s ≈ 27 RPM, safely under the 40 RPM free-tier cap with retries.
+#   Lower only if you have a paid key with higher rate limits.
 MIN_INTERVAL = 2.2
 
 # Observations that mean "that action changed nothing" -> auto dead-end.
