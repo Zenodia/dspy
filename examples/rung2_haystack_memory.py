@@ -268,9 +268,12 @@ def _reason(goal, mem, facts, offered, playbook=""):
                 return a
     except Exception as e:  # noqa: BLE001
         print(f"  {Fore.RED}[reason error: {e}]{Style.RESET_ALL}", flush=True)
-    # fallback: prefer unexplored navigation over a no-op
-    explore = [a for a in offered if a.startswith(("go to", "open"))]
-    return (explore or offered)[0]
+    # fallback: prefer nav/open actions not yet taken (breaks oscillation when
+    # the reasoner times out); fall back to any nav, then any offered action.
+    not_taken = [a for a in offered if a not in mem.taken]
+    explore_new = [a for a in not_taken if a.startswith(("go to", "open"))]
+    explore_any = [a for a in offered if a.startswith(("go to", "open"))]
+    return (explore_new or explore_any or not_taken or offered)[0]
 
 
 # --------------------------------------------------------------------------- #
@@ -302,8 +305,11 @@ class StructuredMemoryAgent(dspy.Module):
                 # 1. DELTA-update the structured memory from the latest obs
                 upd = self.update(task=goal, last_action=mem.last_action or "none",
                                   observation=cur_obs, current_progress=mem.progress)
-                mem.progress = (upd.progress or mem.progress).strip()
-                mem.plan = (upd.plan or mem.plan).strip()
+                # First-line only: LMs append "*Rationale:*" which corrupts the slots
+                # and gets fed back into the next step's prompt, compounding confusion.
+                def _first_line(s): return (s or "").strip().splitlines()[0].strip()
+                mem.progress = _first_line(upd.progress) or mem.progress
+                mem.plan = _first_line(upd.plan) or mem.plan
                 # dead_end: accept ONLY if it is the exact action just taken
                 # (clip the summarizer's occasional sentence-into-the-slot noise)
                 de = (upd.dead_end or "").strip()
@@ -311,7 +317,10 @@ class StructuredMemoryAgent(dspy.Module):
                     mem.add_dead_end(de)
                 # 2. store a new world fact -- but only if it survives the grounding
                 # guardrail (drops hallucinated object locations)
-                fact = ground_fact(upd.new_fact, cur_obs)
+                # Take only the first line: LMs sometimes append "*Rationale:*"
+                # continuation text that would otherwise be stored as a spurious fact.
+                raw_fact = (upd.new_fact or "").strip().splitlines()[0].strip()
+                fact = ground_fact(raw_fact, cur_obs)
                 if fact:
                     _throttle()
                     docs = _doc_embedder().run(
