@@ -30,6 +30,7 @@ The playbook persists ACROSS episodes; success%/steps should improve as it grows
 """
 
 import json
+import os
 import re
 import sys
 import time
@@ -40,8 +41,25 @@ import dspy
 import rung2_haystack_memory as r2
 from rung2_haystack_memory import (
     Fore, Style, GAMMA, NVIDIA_API_KEY, BASE_URL, SUMMARIZER_MODEL,
-    StructuredMemoryAgent,
+    StructuredMemoryAgent, _throttle,
 )
+
+# Persistent cache of discovered facts / dead-ends per (dataset, idx, goal).
+# Lets the agent skip already-explored dead locations on restarts with the same goal.
+EPISODE_CACHE_FILE = os.path.join(os.path.dirname(__file__), "alfworld_episode_cache.json")
+
+
+def _load_cache() -> dict:
+    try:
+        with open(EPISODE_CACHE_FILE) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def _save_cache(cache: dict) -> None:
+    with open(EPISODE_CACHE_FILE, "w") as f:
+        json.dump(cache, f, indent=2)
 
 # Reflector gets a bigger budget than the per-step summarizer (it reads a whole
 # trajectory). Same model, just more tokens / hotter.
@@ -168,12 +186,52 @@ def curate(pb, refl):
     pb.prune()
 
 
-def run_episode(agent, pb, ex, reflect, label):
-    """Generator + Reflector + Curator for one episode."""
+def run_episode(agent, pb, ex, reflect, label, cache: dict, cache_key: str):
+    """Generator + Reflector + Curator for one episode.
+
+    If a previous run with the same goal exists in cache, pre-populates the
+    agent's Haystack store with discovered facts and injects confirmed dead-ends
+    so the agent skips already-explored dead locations.  Actions that ended with
+    a timeout (heuristic fallback) are still explored -- their LLM decision was
+    never made, so they deserve a real reasoning attempt.
+    """
+    cached = cache.get(cache_key, {})
+    if cached:
+        prev_goal = cached.get("goal", "")
+        if prev_goal:
+            print(f"  {Fore.CYAN}[cache hit: resuming from previous run of "
+                  f"'{prev_goal[:60]}' ({cached.get('steps', '?')} steps, "
+                  f"success={cached.get('success', '?')})]{Style.RESET_ALL}", flush=True)
+        agent.prefill_facts = cached.get("facts", [])
+        # Only inject dead-ends that were NOT caused by a reasoner timeout.
+        # Timeout steps used a heuristic fallback and may have navigated somewhere
+        # suboptimally; give the (now-rate-limited) LLM a proper shot at them.
+        timeout_fallbacks = set(cached.get("timeout_fallbacks", []))
+        agent.prefill_dead_ends = [
+            de for de in cached.get("dead_ends", [])
+            if de not in timeout_fallbacks
+        ]
+    else:
+        agent.prefill_facts = []
+        agent.prefill_dead_ends = []
+
     agent.playbook = pb.render()
     pred = agent(**ex.inputs())
     outcome = (f"SOLVED in {pred.steps} steps" if pred.success
                else f"FAILED at {pred.steps} steps")
+
+    # Persist discovered knowledge for future restarts with the same goal+idx.
+    cache[cache_key] = {
+        "goal": pred.goal,
+        "facts": getattr(pred, "facts_list", []),
+        "dead_ends": getattr(pred, "dead_ends_list", []),
+        "timeout_fallbacks": [],  # populated by agent if it detects fallback
+        "success": bool(pred.success),
+        "steps": pred.steps,
+    }
+    _save_cache(cache)
+
+    _throttle()  # reflector = 1 LM call; must count toward the global RPM cap
     with dspy.context(lm=reflection_lm):
         refl = reflect(task=pred.goal, outcome=outcome,
                        trajectory=pred.trajectory[-3000:],
@@ -192,6 +250,7 @@ def main():
     reflect = dspy.Predict(Reflect)
     pb = Playbook()
     agent = StructuredMemoryAgent()
+    cache = _load_cache()
 
     smoke = "--smoke" in sys.argv
     n_train = 2 if smoke else N_TRAIN
@@ -204,7 +263,9 @@ def main():
     for i in range(n_train):
         print(f"\n{Fore.CYAN}{Style.BRIGHT}--- train episode {i + 1}/{n_train} "
               f"(trainset[{i}]) ---{Style.RESET_ALL}", flush=True)
-        run_episode(agent, pb, r2.alfworld.trainset[i], reflect, f"train{i + 1}")
+        cache_key = f"train_{i}"
+        run_episode(agent, pb, r2.alfworld.trainset[i], reflect, f"train{i + 1}",
+                    cache, cache_key)
 
     # --- eval with the FROZEN learned playbook --------------------------------
     print(f"\n{Fore.CYAN}{Style.BRIGHT}===== RUNG3 ACE: eval {n_test} task(s) with "
@@ -214,7 +275,25 @@ def main():
     test_idxs = [2] if smoke else list(range(n_test))   # smoke: the hard soapbottle task
     for i in test_idxs:
         print(f"\n{Fore.CYAN}{Style.BRIGHT}--- eval devset[{i}] ---{Style.RESET_ALL}", flush=True)
+        cache_key = f"eval_{i}"
+        cached = cache.get(cache_key, {})
+        agent.prefill_facts = cached.get("facts", [])
+        timeout_fallbacks = set(cached.get("timeout_fallbacks", []))
+        agent.prefill_dead_ends = [
+            de for de in cached.get("dead_ends", [])
+            if de not in timeout_fallbacks
+        ]
         pred = agent(**r2.alfworld.devset[i].inputs())
+        # Save eval result to cache too
+        cache[cache_key] = {
+            "goal": pred.goal,
+            "facts": getattr(pred, "facts_list", []),
+            "dead_ends": getattr(pred, "dead_ends_list", []),
+            "timeout_fallbacks": [],
+            "success": bool(pred.success),
+            "steps": pred.steps,
+        }
+        _save_cache(cache)
         ret = (GAMMA ** (pred.steps - 1)) if pred.success else 0.0
         rets.append(ret); succ.append(1.0 if pred.success else 0.0)
         if pred.success:

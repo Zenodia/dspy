@@ -30,10 +30,12 @@ isolates the memory as the single variable.
     .venv/bin/python rung1_haystack_memory.py --task 2   # pick devset index
 """
 
+import collections
 import math
 import os
 import re
 import sys
+import threading
 import time
 
 import dspy
@@ -80,10 +82,12 @@ TOP_K_MEMORY = 10
 #   the 40 RPM free-tier limit serialises everything anyway.
 NUM_THREADS = 1
 
-# MIN_INTERVAL: seconds between Haystack/NVIDIA API calls (embed + reason).
-#   2.2s ≈ 27 RPM, safely under the 40 RPM free-tier cap with retries.
-#   Lower only if you have a paid key with higher rate limits.
-MIN_INTERVAL = 2.2
+# Rate-limiting: 28 RPM cap gives safe headroom under the 40 RPM free-tier limit.
+# Sliding-window limiter covers ALL NVIDIA API calls (DSPy LM + embed + reasoner).
+_RPM_CAP = 28
+_MIN_GAP = 60.0 / _RPM_CAP   # ~2.14 s minimum gap between consecutive calls
+_rate_lock = threading.Lock()
+_call_times: collections.deque = collections.deque()  # monotonic timestamps in last 60 s
 
 # Observations that mean "that action changed nothing" -> auto dead-end.
 NOOP_MARKERS = ["nothing happens", "nothing special", "already"]
@@ -98,6 +102,48 @@ summarizer_lm = dspy.LM(
     temperature=0.4, max_tokens=600, num_retries=10,
 )
 dspy.configure(lm=summarizer_lm)
+
+# Common-sense object placement filter: objects are never found in these locations.
+# Used to de-prioritize implausible "go to" actions for the target object.
+_UNLIKELY_LOCATIONS: dict[str, list[str]] = {
+    "cd":            ["vase", "plant", "bathtub", "toilet", "sink", "fridge",
+                      "microwave", "garbagecan", "pot", "pan"],
+    "book":          ["vase", "plant", "bathtub", "toilet", "fridge", "microwave"],
+    "laptop":        ["vase", "plant", "bathtub", "toilet", "sink", "fridge",
+                      "microwave", "garbagecan"],
+    "cellphone":     ["vase", "plant", "bathtub", "toilet", "fridge", "microwave"],
+    "phone":         ["vase", "plant", "bathtub", "toilet", "fridge", "microwave"],
+    "pen":           ["bathtub", "toilet", "fridge", "microwave"],
+    "pencil":        ["bathtub", "toilet", "fridge", "microwave"],
+    "keychain":      ["bathtub", "toilet", "fridge", "microwave", "vase", "plant"],
+    "creditcard":    ["bathtub", "toilet", "fridge", "microwave", "vase"],
+    "remotecontrol": ["bathtub", "toilet", "fridge", "microwave", "vase", "plant"],
+    "newspaper":     ["bathtub", "toilet", "fridge", "sink", "vase", "plant",
+                      "microwave"],
+    "magazine":      ["bathtub", "toilet", "fridge", "sink", "vase", "microwave"],
+    "watch":         ["bathtub", "toilet", "fridge", "microwave", "vase", "plant"],
+    "candle":        ["bathtub", "toilet", "fridge", "vase", "plant"],
+    "statue":        ["bathtub", "toilet", "fridge", "microwave"],
+    "spraybottle":   ["bathtub", "toilet", "fridge", "vase", "plant"],
+    "soapbottle":    ["bathtub", "toilet", "fridge", "vase", "plant"],
+    "knife":         ["vase", "plant"],
+    "fork":          ["vase", "plant"],
+    "spoon":         ["vase", "plant"],
+    "toiletpaper":   ["fridge", "microwave", "vase", "plant"],
+    "handtowel":     ["fridge", "microwave", "vase"],
+    "cloth":         ["fridge", "microwave"],
+}
+
+
+def _common_sense_hint(goal: str) -> str:
+    """Return a one-line common-sense hint for the reasoner based on the goal."""
+    g = goal.lower()
+    for obj, unlikely in _UNLIKELY_LOCATIONS.items():
+        if obj in g:
+            return (f"Common sense: {obj}s are NEVER found in "
+                    f"{', '.join(unlikely)}. Do NOT navigate to those locations.")
+    return ""
+
 
 alfworld = None
 _HAYSTACK = {}
@@ -126,11 +172,22 @@ def log_result(success, steps, ret):
 
 # --- rate limit + Haystack singletons -------------------------------------- #
 def _throttle():
-    last = _HAYSTACK.get("_last", 0.0)
-    dt = time.monotonic() - last
-    if dt < MIN_INTERVAL:
-        time.sleep(MIN_INTERVAL - dt)
-    _HAYSTACK["_last"] = time.monotonic()
+    """Sliding-window rate limiter. Call before EVERY NVIDIA API request
+    (DSPy LM, doc-embed, text-embed, Haystack reasoner) to stay under 28 RPM."""
+    while True:
+        with _rate_lock:
+            now = time.monotonic()
+            while _call_times and now - _call_times[0] >= 60.0:
+                _call_times.popleft()
+            if len(_call_times) < _RPM_CAP:
+                gap = (now - _call_times[-1]) if _call_times else _MIN_GAP
+                if gap >= _MIN_GAP:
+                    _call_times.append(now)
+                    return
+                wait = _MIN_GAP - gap
+            else:
+                wait = 60.0 - (now - _call_times[0]) + 0.1
+        time.sleep(wait)
 
 
 def _reasoner():
@@ -252,39 +309,49 @@ def is_noop(action, before, after):
     return after.strip() == before.strip() and not action.startswith("go to")
 
 
-def _reason(goal, mem, facts, offered, playbook=""):
-    _throttle()
+def _reason(goal, mem, facts, offered, playbook="", common_sense=""):
     tool = make_action_tool(offered)
     user = ""
     if playbook:
-        # rung3 (ACE) injects an evolving cross-episode strategy playbook here.
         user += "Learned strategies (apply when relevant):\n" + playbook + "\n\n"
+    if common_sense:
+        user += common_sense + "\n\n"
     user += f"Task: {goal}\nProgress: {mem.progress}\nPlan: {mem.plan}\n"
     if mem.dead_ends:
         user += "Do NOT repeat these useless actions: " + ", ".join(mem.dead_ends[-8:]) + "\n"
     if facts:
         user += "Relevant facts:\n" + "\n".join(f"- {f}" for f in facts) + "\n"
     user += "Admissible actions:\n" + "\n".join(f"  - {a}" for a in offered)
-    try:
-        out = _reasoner().run(
-            messages=[ChatMessage.from_system(REASON_SYS), ChatMessage.from_user(user)],
-            tools=[tool],
-            generation_kwargs={"tool_choice": "required",
-                               "extra_body": {"chat_template_kwargs": {"thinking": True}},
-                               "max_tokens": 6000, "temperature": 0.6},
-        )
-        reply = out["replies"][0]
-        if reply.tool_calls:
-            a = reply.tool_calls[0].arguments.get("action")
-            if a in offered:
-                return a
-        for a in offered:
-            if a in (reply.text or ""):
-                return a
-    except Exception as e:  # noqa: BLE001
-        print(f"  {Fore.RED}[reason error: {e}]{Style.RESET_ALL}", flush=True)
-    # fallback: prefer nav/open actions not yet taken (breaks oscillation when
-    # the reasoner times out); fall back to any nav, then any offered action.
+
+    for attempt in range(3):
+        _throttle()
+        try:
+            out = _reasoner().run(
+                messages=[ChatMessage.from_system(REASON_SYS), ChatMessage.from_user(user)],
+                tools=[tool],
+                generation_kwargs={"tool_choice": "required",
+                                   "extra_body": {"chat_template_kwargs": {"thinking": True}},
+                                   "max_tokens": 6000, "temperature": 0.6},
+            )
+            reply = out["replies"][0]
+            if reply.tool_calls:
+                a = reply.tool_calls[0].arguments.get("action")
+                if a in offered:
+                    return a
+            for a in offered:
+                if a in (reply.text or ""):
+                    return a
+            return offered[0]  # model returned nothing parseable but didn't throw
+        except Exception as e:  # noqa: BLE001
+            print(f"  {Fore.RED}[reason error (attempt {attempt+1}/3): {e}]{Style.RESET_ALL}",
+                  flush=True)
+            if attempt < 2:
+                backoff = 15 * (attempt + 1)
+                print(f"  {Fore.YELLOW}[backing off {backoff}s before retry]{Style.RESET_ALL}",
+                      flush=True)
+                time.sleep(backoff)
+
+    # fallback after 3 failures: prefer nav/open actions not yet taken
     not_taken = [a for a in offered if a not in mem.taken]
     explore_new = [a for a in not_taken if a.startswith(("go to", "open"))]
     explore_any = [a for a in offered if a.startswith(("go to", "open"))]
@@ -297,18 +364,35 @@ class StructuredMemoryAgent(dspy.Module):
         super().__init__()
         self.max_iters = max_iters
         self.update = dspy.Predict(MemoryUpdate)
-        self.playbook = ""   # rung3 (ACE) sets this to the evolving strategy text
+        self.playbook = ""       # rung3 (ACE) sets this to the evolving strategy text
+        self.prefill_facts = []  # rung3: facts discovered in a previous run (same goal+idx)
+        self.prefill_dead_ends = []  # rung3: confirmed dead-ends from a previous run
 
     def forward(self, idx):
         store = InMemoryDocumentStore()
         retriever = InMemoryEmbeddingRetriever(document_store=store)
         mem = MemoryState()
         reward, steps = 0, 0
+        all_facts: list[str] = []  # every grounded fact stored this episode (for caching)
+
+        # Pre-populate knowledge from a previous run with the same goal+idx.
+        # Batch-embed to save API calls; prefill_dead_ends get injected without game steps.
+        if self.prefill_facts:
+            print(f"  {Fore.CYAN}[prefill: loading {len(self.prefill_facts)} cached facts "
+                  f"+ {len(self.prefill_dead_ends)} dead-ends]{Style.RESET_ALL}", flush=True)
+            _throttle()
+            docs = _doc_embedder().run(
+                documents=[Document(content=f) for f in self.prefill_facts])["documents"]
+            store.write_documents(docs, policy=DuplicatePolicy.OVERWRITE)
+            all_facts.extend(self.prefill_facts)
+        for de in self.prefill_dead_ends:
+            mem.add_dead_end(de)
 
         with alfworld.POOL.session() as env:
             traj = []
             task, info = env.init(idx)
             goal = parse_goal(task)
+            common_sense = _common_sense_hint(goal)
             log_goal(goal)
             cur_obs = "(game start)"
 
@@ -317,23 +401,18 @@ class StructuredMemoryAgent(dspy.Module):
                 log_step(steps + 1)
                 log_obs(cur_obs)
 
-                # 1. DELTA-update the structured memory from the latest obs
+                # 1. DELTA-update the structured memory (throttled: counts as 1 API call)
+                _throttle()
                 upd = self.update(task=goal, last_action=mem.last_action or "none",
                                   observation=cur_obs, current_progress=mem.progress)
-                # First-line only: LMs append "*Rationale:*" which corrupts the slots
-                # and gets fed back into the next step's prompt, compounding confusion.
                 def _first_line(s): return (s or "").strip().splitlines()[0].strip()
                 mem.progress = _first_line(upd.progress) or mem.progress
                 mem.plan = _first_line(upd.plan) or mem.plan
-                # dead_end: accept ONLY if it is the exact action just taken
-                # (clip the summarizer's occasional sentence-into-the-slot noise)
                 de = (upd.dead_end or "").strip()
                 if de and de == (mem.last_action or ""):
                     mem.add_dead_end(de)
-                # 2. store a new world fact -- but only if it survives the grounding
-                # guardrail (drops hallucinated object locations)
-                # Take only the first line: LMs sometimes append "*Rationale:*"
-                # continuation text that would otherwise be stored as a spurious fact.
+
+                # 2. store a grounded world fact
                 raw_fact = (upd.new_fact or "").strip().splitlines()[0].strip()
                 fact = ground_fact(raw_fact, cur_obs)
                 if fact:
@@ -341,10 +420,12 @@ class StructuredMemoryAgent(dspy.Module):
                     docs = _doc_embedder().run(
                         documents=[Document(content=fact)])["documents"]
                     store.write_documents(docs, policy=DuplicatePolicy.OVERWRITE)
+                    if fact not in all_facts:
+                        all_facts.append(fact)
                 log_mem(f"progress=[{mem.progress}]  plan=[{mem.plan}]  "
                         f"dead_ends={mem.dead_ends[-5:]}")
 
-                # 3. recall COMPLEMENTARY facts (query = goal+plan+obs, not just obs)
+                # 3. recall COMPLEMENTARY facts
                 facts = []
                 if store.count_documents() > 0:
                     _throttle()
@@ -353,13 +434,13 @@ class StructuredMemoryAgent(dspy.Module):
                              retriever.run(query_embedding=q, top_k=TOP_K_MEMORY)["documents"]]
                 log_recall(facts)
 
-                # 4. reason over a loop-broken action set: drop dead-ends AND any
-                #    info-action already performed (its result can't change).
+                # 4. reason over a loop-broken action set
                 offered = [a for a in admissible
                            if a not in mem.dead_ends
                            and not (a.startswith(INFO_ACTIONS) and a in mem.taken)]
                 offered = offered or [a for a in admissible if a not in mem.dead_ends] or admissible
-                action = _reason(goal, mem, facts, offered, playbook=self.playbook)
+                action = _reason(goal, mem, facts, offered,
+                                 playbook=self.playbook, common_sense=common_sense)
                 log_action(action)
 
                 # 5. step + auto dead-end detection
@@ -378,7 +459,9 @@ class StructuredMemoryAgent(dspy.Module):
         ret = (GAMMA ** (steps - 1)) if reward else 0.0
         log_result(bool(reward), steps, ret)
         return dspy.Prediction(goal=goal, trajectory="\n".join(traj),
-                               success=reward, steps=steps)
+                               success=reward, steps=steps,
+                               facts_list=all_facts,
+                               dead_ends_list=list(mem.dead_ends))
 
 
 N_TEST = 10   # full run = same 10 devset tasks the baseline was scored on
